@@ -41,3 +41,7 @@ db-reset: db-drop db-create
 # Connect to the development database
 db-connect:
     psql -h localhost lnaddrd_dev
+
+# Format the code
+format:
+    cargo fmt --all

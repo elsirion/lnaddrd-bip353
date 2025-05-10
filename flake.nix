@@ -27,6 +27,8 @@
             clippy
             rust-analyzer
             just
+            postgresql
+            diesel-cli
           ];
 
           shellHook = ''
