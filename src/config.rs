@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use url::Url;
 
 #[derive(Parser)]
 pub struct Config {
@@ -19,6 +18,6 @@ pub struct Config {
     pub dns_bind: SocketAddr,
 
     /// The database URL
-    #[clap(long, env = "LNADDRD_DATABASE_URL")]
-    pub database: Url,
+    #[clap(long, env = "LNADDRD_DATABASE_URL", default_value = "postgres://localhost:5432/lnaddrd")]
+    pub database: String,
 }

@@ -1,8 +1,5 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use diesel::PgConnection;
-use diesel::r2d2::{ConnectionManager, Pool};
-use diesel_migrations::MigrationHarness;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{LowerName, Name, Record, RecordSet, RecordType, rdata};
 use hickory_server::ServerFuture;
@@ -16,39 +13,24 @@ use std::iter::once;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, trace, warn};
-use url::Url;
 
 use crate::config::Config;
-use crate::db::{ConnectionPool, MIGRATIONS, get_lnaddress};
+use crate::repositroy::pg::PgPaymentAddressRepository;
+use crate::repositroy::PaymentAddressRepository;
 
 pub struct DnsServer {
     config: Config,
-    db: ConnectionPool,
 }
 
 impl DnsServer {
     pub fn new(config: Config) -> anyhow::Result<Self> {
-        let db = get_connection_pool(&config.database)?;
-        Ok(Self { config, db })
-    }
-
-    fn run_migrations(&self) -> Result<()> {
-        let mut conn = self.db.get()?;
-        let migrations = conn
-            .run_pending_migrations(MIGRATIONS)
-            .map_err(|e| anyhow::anyhow!("Failed to run migrations: {}", e))?;
-
-        if !migrations.is_empty() {
-            info!("Applied migrations {}", migrations.len());
-        }
-
-        Ok(())
+        Ok(Self { config })
     }
 
     pub async fn run(&self) -> Result<()> {
-        self.run_migrations()?;
-
         info!("Starting DNS server on {}", self.config.dns_bind);
+
+        let repository = PgPaymentAddressRepository::new(&self.config.database)?.into_dyn();
 
         // Create a new catalog
         let mut catalog = Catalog::new();
@@ -63,7 +45,7 @@ impl DnsServer {
 
             debug!("Adding zone: {:?}", zone);
 
-            let authority = Arc::new(DbAuthority::new(LowerName::new(&zone), self.db.clone()));
+            let authority = Arc::new(Bip353Authority::new(LowerName::new(&zone), repository.clone()));
             catalog.upsert(LowerName::new(&zone), Box::new(authority));
         }
 
@@ -78,14 +60,14 @@ impl DnsServer {
     }
 }
 
-struct DbAuthority {
+struct Bip353Authority {
     zone: LowerName,
-    db: Pool<ConnectionManager<PgConnection>>,
+    repository: PaymentAddressRepository,
 }
 
-impl DbAuthority {
-    pub fn new(zone: LowerName, db: Pool<ConnectionManager<PgConnection>>) -> Self {
-        Self { zone, db }
+impl Bip353Authority {
+    pub fn new(zone: LowerName, repository: PaymentAddressRepository) -> Self {
+        Self { zone, repository }
     }
 
     async fn lookup_inner(
@@ -97,14 +79,12 @@ impl DbAuthority {
             return Err(LookupError::ResponseCode(ResponseCode::NXDomain));
         }
 
-        let mut conn = self.db.get().map_err(server_failure)?;
-
         let user = extract_username(&self.zone.clone().into(), &name.into())?;
         let domain = self.get_domain();
 
         info!("Lookup for user: {}, domain: {}", user, domain);
 
-        let lnaddress = get_lnaddress(&mut conn, &domain, &user)
+        let lnaddress = self.repository.get_payment_address(&domain, &user)
             .await
             .map_err(server_failure)?
             .ok_or_else(|| LookupError::ResponseCode(ResponseCode::NXDomain))?;
@@ -122,14 +102,15 @@ impl DbAuthority {
     }
 
     fn get_domain(&self) -> String {
-        let mut domain = Name::from_labels(Name::from(&self.zone).iter().skip(2)).expect("Shorter domain can always be created");
+        let mut domain = Name::from_labels(Name::from(&self.zone).iter().skip(2))
+            .expect("Shorter domain can always be created");
         domain.set_fqdn(false); // We don't want the point at the end
         domain.to_string()
     }
 }
 
 #[async_trait]
-impl Authority for DbAuthority {
+impl Authority for Bip353Authority {
     type Lookup = AuthLookup;
 
     fn zone_type(&self) -> ZoneType {
@@ -179,14 +160,6 @@ impl Authority for DbAuthority {
         warn!("get_nsec_records");
         Err(LookupError::ResponseCode(ResponseCode::Refused))
     }
-}
-
-pub fn get_connection_pool(database_url: &Url) -> anyhow::Result<ConnectionPool> {
-    let manager = ConnectionManager::<PgConnection>::new(database_url.to_string());
-    Pool::builder()
-        .test_on_check_out(true)
-        .build(manager)
-        .context("Could not build connection pool")
 }
 
 fn server_failure(e: impl Display) -> LookupError {
